@@ -11,6 +11,7 @@ use crate::{InputBackend, ReadResult, ShellError, input_backend::InteractiveProm
 /// and reporting results to standard output and standard error streams.
 pub struct ReedlineInputBackend {
     reedline: Option<reedline::Reedline>,
+    pending_read_buffer: Option<(String, usize)>,
     updatable_bindings: std::sync::Arc<tokio::sync::Mutex<edit_mode::UpdatableBindings>>,
     configured_mode: Option<(LineEditingMode, u64)>,
     installed_bindings_revision: Option<u64>,
@@ -138,6 +139,7 @@ impl ReedlineInputBackend {
 
         Ok(Self {
             reedline: Some(reedline),
+            pending_read_buffer: None,
             updatable_bindings,
             configured_mode: None,
             installed_bindings_revision: None,
@@ -231,6 +233,18 @@ impl InputBackend for ReedlineInputBackend {
         self.installed_bindings_revision = Some(revision);
         self.configured_mode = Some(requested);
         reedline = reedline.with_buffer_editor(editor_command, path);
+        // Restore callback state under the requested mode. Applying it earlier
+        // can clamp an insert-mode end cursor while vi normal is still active.
+        if let Some((buffer, cursor)) = self.pending_read_buffer.take() {
+            reedline.run_edit_commands(&[
+                reedline::EditCommand::Clear,
+                reedline::EditCommand::InsertString(buffer),
+                reedline::EditCommand::MoveToPosition {
+                    position: cursor,
+                    select: false,
+                },
+            ]);
+        }
         let result = reedline.read_line(&prompt);
         let mode = reedline.prompt_edit_mode();
         self.reedline = Some(reedline);
@@ -246,26 +260,18 @@ impl InputBackend for ReedlineInputBackend {
     }
 
     fn get_read_buffer(&self) -> Option<(String, usize)> {
-        self.reedline.as_ref().map(|r| {
-            (
-                r.current_buffer_contents().to_owned(),
-                r.current_insertion_point(),
-            )
+        self.pending_read_buffer.clone().or_else(|| {
+            self.reedline.as_ref().map(|r| {
+                (
+                    r.current_buffer_contents().to_owned(),
+                    r.current_insertion_point(),
+                )
+            })
         })
     }
 
     fn set_read_buffer(&mut self, buffer: String, cursor: usize) {
-        if let Some(reedline) = &mut self.reedline {
-            reedline.run_edit_commands(&[
-                reedline::EditCommand::MoveToStart { select: false },
-                reedline::EditCommand::ClearToLineEnd,
-                reedline::EditCommand::InsertString(buffer),
-                reedline::EditCommand::MoveToPosition {
-                    position: cursor,
-                    select: false,
-                },
-            ]);
-        }
+        self.pending_read_buffer = Some((buffer, cursor));
     }
 }
 
@@ -401,6 +407,21 @@ fn compose_vi_command_key_bindings() -> reedline::Keybindings {
 mod tests {
     use super::*;
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn latest_pending_callback_buffer_is_visible_before_resuming_input() {
+        let shell = brush_core::Shell::builder().build().await.unwrap();
+        let shell = std::sync::Arc::new(tokio::sync::Mutex::new(shell));
+        let mut backend = ReedlineInputBackend::new(&crate::UIOptions::default(), &shell).unwrap();
+        backend.set_read_buffer("abc".into(), 3);
+        assert_eq!(backend.get_read_buffer(), Some(("abc".into(), 3)));
+
+        // Each update supersedes the pending state, even when clearing it.
+        backend.set_read_buffer("next".into(), 2);
+        assert_eq!(backend.get_read_buffer(), Some(("next".into(), 2)));
+        backend.set_read_buffer(String::new(), 0);
+        assert_eq!(backend.get_read_buffer(), Some((String::new(), 0)));
+    }
+
     #[test]
     fn editor_arguments_are_unquoted_but_never_expanded() {
         let command = parse_editor_command(
@@ -457,6 +478,7 @@ mod tests {
         ));
         let shell = std::sync::Arc::new(tokio::sync::Mutex::new(shell));
         let mut backend = ReedlineInputBackend::new(&crate::UIOptions::default(), &shell).unwrap();
+        backend.set_read_buffer("callback result".into(), 15);
         let prompt = InteractivePrompt {
             prompt: String::new(),
             alt_side_prompt: String::new(),
@@ -467,6 +489,10 @@ mod tests {
         );
         assert!(backend.reedline.is_some());
         assert!(backend.editor_directory.is_none());
+        assert_eq!(
+            backend.get_read_buffer(),
+            Some(("callback result".into(), 15))
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -482,6 +508,7 @@ mod tests {
             .set_line_editing_mode(LineEditingMode::Emacs);
         let shell = std::sync::Arc::new(tokio::sync::Mutex::new(shell));
         let mut backend = ReedlineInputBackend::new(&crate::UIOptions::default(), &shell).unwrap();
+        backend.set_read_buffer("callback result".into(), 15);
         let bindings = backend.updatable_bindings.clone();
         let _guard = bindings.lock().await;
         {
@@ -496,7 +523,11 @@ mod tests {
                 Poll::Pending
             ));
         }
-        assert!(backend.get_read_buffer().is_some());
+        assert!(backend.reedline.is_some());
+        assert_eq!(
+            backend.get_read_buffer(),
+            Some(("callback result".into(), 15))
+        );
     }
 
     #[test]
